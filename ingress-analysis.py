@@ -79,7 +79,11 @@ def build_ui() -> None:
     chart_period_var = tk.StringVar(value="")
     alert_col_width_var = tk.StringVar(value="300")
     day_col_width_var = tk.StringVar(value="25")
+    apm_col_width_var = tk.StringVar(value="40")
     last_prompted_label = tk.StringVar(value="")
+    all_vehicle_ids: list[str] = []
+    selected_vehicle_vars: dict[str, tk.BooleanVar] = {}
+    vehicle_filter_text = tk.StringVar(value="")
     alert_popup: tk.Toplevel | None = None
 
     def refresh_dropdown() -> None:
@@ -110,6 +114,7 @@ def build_ui() -> None:
             current_headers.extend(headers)
             current_rows.clear()
             current_rows.extend(all_rows)
+            refresh_vehicle_filter_options()
             load_info_var.set(message)
             populate_table(headers, preview_rows)
             refresh_pivot_options(headers)
@@ -151,8 +156,8 @@ def build_ui() -> None:
     fleet_tab = ttk.Frame(notebook)
     apm_tab = ttk.Frame(notebook)
     notebook.add(pivot_tab, text="Pivot")
-    notebook.add(fleet_tab, text="Fleet")
-    notebook.add(apm_tab, text="BY APM")
+    notebook.add(fleet_tab, text="BY FLEET")
+    notebook.add(apm_tab, text="BY ALERT")
 
     preview_frame = ttk.LabelFrame(pivot_tab, text="Preview (first 200 rows)")
     preview_frame.pack(fill="both", expand=True, pady=(0, 8))
@@ -259,12 +264,33 @@ def build_ui() -> None:
         fleet_buttons, text="Quarter", command=lambda: set_fleet_period("quarter")
     ).pack(side="left", padx=2)
 
-    chart_period_row = ttk.Frame(fleet_tab)
-    chart_period_row.pack(fill="x", padx=4, pady=(0, 4))
-    ttk.Label(chart_period_row, text="Chart period:").pack(side="left")
-    chart_period_dropdown = tk.OptionMenu(chart_period_row, chart_period_var, "")
-    chart_period_dropdown.configure(width=20)
-    chart_period_dropdown.pack(side="left", padx=(4, 12))
+    vehicle_filter_frame = ttk.LabelFrame(fleet_tab, text="Filter by APM (Vehicle ID)")
+    vehicle_filter_frame.pack(fill="both", padx=4, pady=(0, 6))
+    filter_controls = ttk.Frame(vehicle_filter_frame)
+    filter_controls.pack(fill="x", pady=(4, 2))
+    ttk.Label(filter_controls, text="Filter:").pack(side="left")
+    filter_entry = ttk.Entry(filter_controls, textvariable=vehicle_filter_text, width=24)
+    filter_entry.pack(side="left", padx=(4, 10))
+    ttk.Button(filter_controls, text="Select all", command=lambda: select_all_vehicles(True)).pack(
+        side="left", padx=(0, 4)
+    )
+    ttk.Button(filter_controls, text="Clear all", command=lambda: select_all_vehicles(False)).pack(
+        side="left"
+    )
+    ttk.Button(filter_controls, text="Refresh", command=lambda: [refresh_vehicle_filter_options(), build_fleet_counts()]).pack(
+        side="left", padx=(6, 0)
+    )
+
+    vehicle_list_canvas = tk.Canvas(vehicle_filter_frame, height=120)
+    vehicle_list_scroll = ttk.Scrollbar(vehicle_filter_frame, orient="vertical", command=vehicle_list_canvas.yview)
+    vehicle_list_inner = ttk.Frame(vehicle_list_canvas)
+    vehicle_list_inner.bind(
+        "<Configure>", lambda e: vehicle_list_canvas.configure(scrollregion=vehicle_list_canvas.bbox("all"))
+    )
+    vehicle_list_canvas.create_window((0, 0), window=vehicle_list_inner, anchor="nw")
+    vehicle_list_canvas.configure(yscrollcommand=vehicle_list_scroll.set)
+    vehicle_list_canvas.pack(side="left", fill="both", expand=True, padx=(0, 4), pady=(0, 4))
+    vehicle_list_scroll.pack(side="right", fill="y", pady=(0, 4))
 
     width_controls = ttk.Frame(fleet_tab)
     width_controls.pack(fill="x", padx=4, pady=(0, 6))
@@ -303,13 +329,20 @@ def build_ui() -> None:
     fleet_x_scroll.pack(side="bottom", fill="x")
     fleet_table.bind("<<TreeviewSelect>>", lambda e: on_fleet_select())
 
+    chart_period_row = ttk.Frame(fleet_tab)
+    chart_period_row.pack(fill="x", padx=4, pady=(4, 4))
+    ttk.Label(chart_period_row, text="Chart period:").pack(side="left")
+    chart_period_dropdown = tk.OptionMenu(chart_period_row, chart_period_var, "")
+    chart_period_dropdown.configure(width=20)
+    chart_period_dropdown.pack(side="left", padx=(4, 12))
+
     chart_frame = ttk.LabelFrame(fleet_tab, text="Fleet alert bar chart")
     chart_frame.pack(fill="both", expand=True, padx=2, pady=(0, 6))
     chart_body = ttk.Frame(chart_frame)
     chart_body.pack(fill="both", expand=True, padx=4, pady=4)
 
-    bar_canvas = tk.Canvas(chart_body, height=260, background="white")
-    bar_canvas.pack(side="left", fill="both", expand=True)
+    chart_canvas_frame = ttk.Frame(chart_body)
+    chart_canvas_frame.pack(side="left", fill="both", expand=True)
 
     id_frame = ttk.Frame(chart_body, width=360)
     id_frame.pack(side="right", fill="both", expand=True)
@@ -329,6 +362,22 @@ def build_ui() -> None:
     )
     apm_info.pack(fill="x", pady=(4, 4), padx=4)
 
+    apm_width_controls = ttk.Frame(apm_tab)
+    apm_width_controls.pack(fill="x", padx=4, pady=(0, 6))
+    ttk.Label(apm_width_controls, text="Alert col width:").pack(side="left")
+    apm_alert_width_entry = ttk.Entry(apm_width_controls, textvariable=alert_col_width_var, width=8)
+    apm_alert_width_entry.pack(side="left", padx=(4, 4))
+    ttk.Label(apm_width_controls, textvariable=alert_col_width_var).pack(side="left", padx=(0, 10))
+
+    ttk.Label(apm_width_controls, text="APM col width:").pack(side="left")
+    apm_day_width_entry = ttk.Entry(apm_width_controls, textvariable=apm_col_width_var, width=8)
+    apm_day_width_entry.pack(side="left", padx=(4, 4))
+    ttk.Label(apm_width_controls, textvariable=apm_col_width_var).pack(side="left", padx=(0, 10))
+
+    ttk.Button(apm_width_controls, text="Apply widths", command=lambda: apply_apm_width_settings()).pack(
+        side="left", padx=(10, 0)
+    )
+
     apm_frame = ttk.LabelFrame(apm_tab, text="Alerts x APM")
     apm_frame.pack(fill="both", expand=True, padx=2, pady=(0, 6))
 
@@ -342,6 +391,7 @@ def build_ui() -> None:
     apm_table.pack(side="top", fill="both", expand=True)
     apm_y_scroll.pack(side="right", fill="y")
     apm_x_scroll.pack(side="bottom", fill="x")
+    apm_table.bind("<<TreeviewSelect>>", lambda e: on_apm_select())
 
     def refresh_pivot_options(headers: list[str]) -> None:
         def _fill(menu: tk.Misc, variable: tk.StringVar) -> None:
@@ -420,10 +470,24 @@ def build_ui() -> None:
     def populate_apm_table(headers: list[str], rows: list[list[str]]) -> None:
         clear_apm_table()
         apm_table.configure(columns=headers)
-        widths = compute_column_widths(headers, rows, min_width=60, max_width=240)
+        try:
+            first_width = int(alert_col_width_var.get())
+        except ValueError:
+            first_width = 300
+            alert_col_width_var.set(str(first_width))
+        try:
+            apm_width = int(apm_col_width_var.get())
+        except ValueError:
+            apm_width = 40
+            apm_col_width_var.set(str(apm_width))
+        default_width = 120
         for idx, name in enumerate(headers):
+            if idx == 0:
+                width = first_width
+            else:
+                width = apm_width or default_width
             apm_table.heading(name, text=name)
-            apm_table.column(name, width=widths[idx], anchor="w", stretch=False)
+            apm_table.column(name, width=width, anchor="w", stretch=False, minwidth=width)
         for row in rows:
             values = row + [""] * (len(headers) - len(row))
             apm_table.insert("", "end", values=values[: len(headers)])
@@ -450,6 +514,13 @@ def build_ui() -> None:
     def set_chart_period(period: str) -> None:
         chart_period_var.set(period)
         draw_bar_chart()
+
+    def apply_apm_width_settings() -> None:
+        """Re-render APM table with current width settings."""
+        populate_apm_table(
+            list(apm_table["columns"]),
+            [apm_table.item(row_id)["values"] for row_id in apm_table.get_children()],
+        )
 
     def apply_width_settings() -> None:
         """Re-render fleet table with current width settings."""
@@ -501,11 +572,32 @@ def build_ui() -> None:
         sorted_periods, _ = sort_periods(periods, [0] * len(periods))
         return sorted_periods
 
+    def compute_alert_date_range(alert_name: str) -> tuple[str, str] | None:
+        """Return min/max dates for a given alert based on the Date column."""
+        date_idx = find_header_index("Date")
+        alert_idx = find_header_index("RFDS Alert")
+        if date_idx is None or alert_idx is None:
+            return None
+        min_dt: datetime | None = None
+        max_dt: datetime | None = None
+        for row in current_rows:
+            if alert_idx < len(row) and row[alert_idx] == alert_name:
+                dt = parse_date(row[date_idx]) if date_idx < len(row) else None
+                if dt:
+                    if min_dt is None or dt < min_dt:
+                        min_dt = dt
+                    if max_dt is None or dt > max_dt:
+                        max_dt = dt
+        if min_dt and max_dt:
+            return min_dt.strftime("%Y-%m-%d"), max_dt.strftime("%Y-%m-%d")
+        return None
+
     def show_alert_popup(label: str, periods: list[str], counts: list[int], period_kind: str) -> None:
         nonlocal alert_popup
         if alert_popup is not None and alert_popup.winfo_exists():
             alert_popup.destroy()
-        periods, counts = sort_periods(periods, counts)
+        if period_kind != "apm":
+            periods, counts = sort_periods(periods, counts)
         alert_popup = tk.Toplevel(root)
         alert_popup.title(f"Selected alert: {label}")
         try:
@@ -515,6 +607,19 @@ def build_ui() -> None:
         container = ttk.Frame(alert_popup, padding=10)
         container.pack(fill="both", expand=True)
         ttk.Label(container, text=f"Alert: {label}").pack(anchor="w")
+        # Date range display
+        parsed_dates = [parse_period_label(p) for p in periods if parse_period_label(p)]
+        range_text: str | None = None
+        if parsed_dates:
+            start = min(parsed_dates).strftime("%Y-%m-%d")
+            end = max(parsed_dates).strftime("%Y-%m-%d")
+            range_text = f"Date range: {start} to {end}"
+        else:
+            computed_range = compute_alert_date_range(label)
+            if computed_range:
+                range_text = f"Date range: {computed_range[0]} to {computed_range[1]}"
+        if range_text:
+            ttk.Label(container, text=range_text).pack(anchor="w")
 
         if not periods or not counts or all(c == 0 for c in counts):
             ttk.Label(container, text="No data to chart for this alert.").pack(anchor="w", pady=(8, 0))
@@ -541,11 +646,17 @@ def build_ui() -> None:
             return slope, intercept
 
         parsed_dates: list[datetime | None] = [parse_period_label(p) for p in periods]
-        all_parsed = all(d is not None for d in parsed_dates)
+        all_parsed = period_kind != "apm" and all(d is not None for d in parsed_dates)
 
         if all_parsed and parsed_dates:
             x_vals = [mdates.date2num(dt) for dt in parsed_dates]
-            ax.bar(x_vals, counts, width=5, color="#5b8def", edgecolor="#2f5fb3")
+            colors = ["#5b8def"] * len(counts)
+            if period_kind == "apm":
+                # Highlight top 3 counts
+                top_idx = sorted(range(len(counts)), key=lambda i: counts[i], reverse=True)[:3]
+                for i in top_idx:
+                    colors[i] = "#d9534f"
+            ax.bar(x_vals, counts, width=5, color=colors, edgecolor="#2f5fb3")
             ax.xaxis_date()
             formatter = mdates.DateFormatter("%Y-%m-%d")
             ax.xaxis.set_major_formatter(formatter)
@@ -553,25 +664,31 @@ def build_ui() -> None:
             ax.set_xlabel("Date / Period")
         else:
             x_vals = list(range(len(periods)))
-            ax.bar(x_vals, counts, width=0.8, color="#5b8def", edgecolor="#2f5fb3")
+            colors = ["#5b8def"] * len(counts)
+            if period_kind == "apm":
+                top_idx = sorted(range(len(counts)), key=lambda i: counts[i], reverse=True)[:3]
+                for i in top_idx:
+                    colors[i] = "#d9534f"
+            ax.bar(x_vals, counts, width=0.8, color=colors, edgecolor="#2f5fb3")
             ax.set_xticks(x_vals)
             ax.set_xticklabels(periods, rotation=45, ha="right")
-            ax.set_xlabel("Period")
+            ax.set_xlabel("APM" if period_kind == "apm" else "Period")
 
-        lr = linear_regression(x_vals, counts)
-        if lr:
-            slope, intercept = lr
-            x_min, x_max = min(x_vals), max(x_vals)
-            x_line = [x_min, x_max]
-            y_line = [slope * xv + intercept for xv in x_line]
-            ax.plot(x_line, y_line, color="#d9534f", linestyle="--", linewidth=1.5, label="Trend (linear)")
+        if period_kind != "apm":
+            lr = linear_regression(x_vals, counts)
+            if lr:
+                slope, intercept = lr
+                x_min, x_max = min(x_vals), max(x_vals)
+                x_line = [x_min, x_max]
+                y_line = [slope * xv + intercept for xv in x_line]
+                ax.plot(x_line, y_line, color="#d9534f", linestyle="--", linewidth=1.5, label="Trend (linear)")
 
-        if counts:
-            avg = sum(counts) / len(counts)
-            ax.axhline(avg, color="#f0ad4e", linestyle="-.", linewidth=1.5, label="Average")
+            if counts:
+                avg = sum(counts) / len(counts)
+                ax.axhline(avg, color="#f0ad4e", linestyle="-.", linewidth=1.5, label="Average")
 
-        if lr or counts:
-            ax.legend()
+            if lr or counts:
+                ax.legend()
 
         ax.set_ylabel("Alert count")
         ax.set_title(label)
@@ -631,26 +748,45 @@ def build_ui() -> None:
                 counts.append(0)
         show_alert_popup(label, periods, counts, fleet_period_var.get())
 
+    def on_apm_select() -> None:
+        sel = apm_table.selection()
+        if not sel:
+            return
+        item = apm_table.item(sel[0])
+        values = item.get("values", [])
+        if not values:
+            return
+        label = str(values[0])
+        if label == last_prompted_label.get():
+            return
+        last_prompted_label.set(label)
+        periods = list(apm_table["columns"])[1:]
+        counts: list[int] = []
+        for val in values[1 : len(periods) + 1]:
+            try:
+                counts.append(int(val))
+            except (TypeError, ValueError):
+                counts.append(0)
+        show_alert_popup(label, periods, counts, "apm")
+
     def draw_bar_chart() -> None:
         headers = list(fleet_table["columns"])
         period = chart_period_var.get()
-        bar_canvas.delete("all")
+        for child in chart_canvas_frame.winfo_children():
+            child.destroy()
         if not headers or not period:
-            bar_canvas.create_text(
-                10, 10, anchor="nw", text="Load data and choose a chart period."
-            )
+            ttk.Label(chart_canvas_frame, text="Load data and choose a chart period.").pack(anchor="nw")
             populate_id_table([])
             return
         try:
             period_idx = headers.index(period)
         except ValueError:
-            bar_canvas.create_text(
-                10, 10, anchor="nw", text="Selected period not found in table."
-            )
+            ttk.Label(chart_canvas_frame, text="Selected period not found in table.").pack(anchor="nw")
             populate_id_table([])
             return
-        alerts = []
-        counts = []
+
+        alerts: list[str] = []
+        counts: list[int] = []
         for row_id in fleet_table.get_children():
             row_vals = fleet_table.item(row_id)["values"]
             if len(row_vals) <= period_idx:
@@ -665,46 +801,31 @@ def build_ui() -> None:
                 counts.append(0)
 
         if not counts:
-            bar_canvas.create_text(10, 10, anchor="nw", text="No data to chart.")
+            ttk.Label(chart_canvas_frame, text="No data to chart.").pack(anchor="nw")
             populate_id_table([])
             return
 
-        max_val = max(counts)
-        width = int(bar_canvas.winfo_width() or 800)
-        height = int(bar_canvas.winfo_height() or 260)
-        margin = 40
-        bar_space = max(1, width - margin * 2)
-        n = len(counts)
-        bar_width = max(10, min(120, bar_space // max(1, n)))
-        gap = max(6, min(20, (bar_space - bar_width * n) // max(1, n)))
-
         ids_to_alerts: list[tuple[str, str]] = []
-        x = margin
-        for idx, (label, value) in enumerate(zip(alerts, counts), start=1):
+        id_labels: list[str] = []
+        for idx, alert_name in enumerate(alerts, start=1):
             id_label = f"A{idx}"
-            ids_to_alerts.append((id_label, label))
-            bar_height = 0 if max_val == 0 else int((value / max_val) * (height - 80))
-            y0 = height - margin
-            y1 = y0 - bar_height
-            bar_canvas.create_rectangle(
-                x, y1, x + bar_width, y0, fill="#5b8def", outline="#2f5fb3"
-            )
-            bar_canvas.create_text(
-                x + bar_width / 2, y0 + 12, text=id_label, anchor="n", angle=0
-            )
-            bar_canvas.create_text(
-                x + bar_width / 2, y1 - 10, text=str(value), anchor="s"
-            )
-            x += bar_width + gap
+            ids_to_alerts.append((id_label, alert_name))
+            id_labels.append(id_label)
+
+        fig = Figure(figsize=(7.2, 3.2), dpi=100)
+        ax = fig.add_subplot(111)
+        x_vals = list(range(len(counts)))
+        ax.bar(x_vals, counts, width=0.8, color="#5b8def", edgecolor="#2f5fb3")
+        ax.set_xticks(x_vals)
+        ax.set_xticklabels(id_labels, rotation=0, ha="center")
+        ax.set_ylabel("Count")
+        ax.set_title(f"Period: {period}")
+
+        canvas = FigureCanvasTkAgg(fig, master=chart_canvas_frame)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill="both", expand=True)
 
         populate_id_table(ids_to_alerts)
-
-        # Axes
-        bar_canvas.create_line(margin, height - margin, width - margin, height - margin)
-        bar_canvas.create_line(margin, height - margin, margin, margin)
-        bar_canvas.create_text(
-            margin, margin - 10, anchor="w", text=f"Period: {period}"
-        )
 
     def find_header_index(target: str) -> int | None:
         """Find header index ignoring case and surrounding spaces."""
@@ -731,6 +852,64 @@ def build_ui() -> None:
         fleet_period_var.set(period)
         build_fleet_counts()
 
+    def refresh_vehicle_filter_options() -> None:
+        # Clear existing
+        previous_selected = {
+            vid for vid, var in selected_vehicle_vars.items() if var.get()
+        }
+        for child in vehicle_list_inner.winfo_children():
+            child.destroy()
+        selected_vehicle_vars.clear()
+        all_vehicle_ids.clear()
+        filter_text = vehicle_filter_text.get().strip().lower()
+
+        vehicle_idx = find_header_index("Vehicle ID")
+        if vehicle_idx is None:
+            ttk.Label(vehicle_list_inner, text="No Vehicle ID column found").pack(anchor="w")
+            return
+
+        ids_seen: list[str] = []
+        for row in current_rows:
+            vehicle_raw = row[vehicle_idx] if vehicle_idx < len(row) else ""
+            if not vehicle_raw:
+                continue
+            if vehicle_raw not in ids_seen:
+                ids_seen.append(vehicle_raw)
+
+        filtered_ids = [
+            vid for vid in ids_seen if (not filter_text or filter_text in vid.lower())
+        ]
+        for idx, vehicle_id in enumerate(filtered_ids):
+            all_vehicle_ids.append(vehicle_id)
+            var = tk.BooleanVar(value=vehicle_id in previous_selected or not previous_selected)
+            selected_vehicle_vars[vehicle_id] = var
+            ttk.Checkbutton(vehicle_list_inner, text=vehicle_id, variable=var).grid(
+                row=idx // 6, column=idx % 6, sticky="w", padx=4, pady=2
+            )
+
+        vehicle_list_canvas.yview_moveto(0)
+
+    vehicle_filter_text.trace_add("write", lambda *_: refresh_vehicle_filter_options())
+
+    def select_all_vehicles(state: bool) -> None:
+        for var in selected_vehicle_vars.values():
+            var.set(state)
+        build_fleet_counts()
+
+    def get_filtered_rows() -> list[list[str]]:
+        vehicle_idx = find_header_index("Vehicle ID")
+        if vehicle_idx is None:
+            return current_rows
+        selected_ids = [vid for vid, var in selected_vehicle_vars.items() if var.get()]
+        if not selected_ids:
+            return []
+        filtered: list[list[str]] = []
+        for row in current_rows:
+            vehicle_val = row[vehicle_idx] if vehicle_idx < len(row) else ""
+            if vehicle_val in selected_ids:
+                filtered.append(row)
+        return filtered
+
     def build_fleet_counts() -> None:
         """Builds a fleet-wide alert count table grouped by period."""
         required_fields = ["RFDS Alert"]
@@ -738,6 +917,7 @@ def build_ui() -> None:
             status_var.set("Load a CSV before building fleet counts")
             status_label.configure(foreground="red")
             clear_fleet_table()
+            clear_apm_table()
             return
         missing = [field for field in required_fields if field not in current_headers]
         if missing:
@@ -746,6 +926,7 @@ def build_ui() -> None:
             )
             status_label.configure(foreground="red")
             clear_fleet_table()
+            clear_apm_table()
             return
         alert_idx = find_header_index("RFDS Alert")
         date_idx = find_header_index("Date")
@@ -753,11 +934,13 @@ def build_ui() -> None:
             status_var.set("Could not find 'RFDS Alert' column")
             status_label.configure(foreground="red")
             clear_fleet_table()
+            clear_apm_table()
             return
         if date_idx is None and fleet_period_var.get() != "all":
             status_var.set("Date column not found; cannot group by time")
             status_label.configure(foreground="red")
             clear_fleet_table()
+            clear_apm_table()
             return
 
         alert_order: list[str] = []
@@ -768,7 +951,15 @@ def build_ui() -> None:
             if value not in collection:
                 collection.append(value)
 
-        for row in current_rows:
+        rows_source = get_filtered_rows()
+        if not rows_source:
+            status_var.set("No data after APM filter")
+            status_label.configure(foreground="red")
+            clear_fleet_table()
+            clear_apm_table()
+            return
+
+        for row in rows_source:
             alert_val = row[alert_idx] if alert_idx < len(row) else ""
             remember(alert_val, alert_order)
 
@@ -870,6 +1061,33 @@ def build_ui() -> None:
             )
 
         populate_fleet_table(headers, fleet_rows)
+
+        # Build APM table
+        vehicle_idx = find_header_index("Vehicle ID")
+        if vehicle_idx is not None:
+            apm_headers = ["Alert"]
+            apm_rows: list[list[str]] = []
+            # Keep consistent vehicle order based on data appearance
+            vehicle_order: list[str] = []
+            apm_counts: dict[str, dict[str, int]] = {}
+            for row in current_rows:
+                alert_val = row[alert_idx] if alert_idx < len(row) else ""
+                vehicle_raw = row[vehicle_idx] if vehicle_idx < len(row) else ""
+                vehicle_val = re.sub(r"\\D", "", vehicle_raw)[-4:] if vehicle_raw else ""
+                if vehicle_val not in vehicle_order:
+                    vehicle_order.append(vehicle_val)
+                apm_counts.setdefault(alert_val, {})
+                apm_counts[alert_val][vehicle_val] = apm_counts[alert_val].get(vehicle_val, 0) + 1
+            apm_headers += vehicle_order
+            for alert_val in alert_order:
+                row_counts = apm_counts.get(alert_val, {})
+                apm_rows.append(
+                    [alert_val] + [str(row_counts.get(v, 0)) for v in vehicle_order]
+                )
+            populate_apm_table(apm_headers, apm_rows)
+        else:
+            clear_apm_table()
+
         refresh_chart_period_menu(period_order)
         draw_bar_chart()
         status_var.set(
