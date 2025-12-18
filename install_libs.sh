@@ -3,7 +3,7 @@
 set -euo pipefail
 
 # Creates a local virtual environment and installs Python packages needed for
-# ingress-analysis.py.
+# 0_ingress-analysis.py.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
