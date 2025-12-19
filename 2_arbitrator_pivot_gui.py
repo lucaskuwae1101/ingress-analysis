@@ -241,7 +241,7 @@ def category_severity_table(df: pd.DataFrame) -> pd.DataFrame:
 def build_ui() -> None:
     root = tk.Tk()
     root.title("Arbitrator Alerts Pivot")
-    root.geometry("1180x780")
+    root.geometry("1300x800")
     root.protocol("WM_DELETE_WINDOW", root.destroy)
     root.bind("<Key-q>", lambda e: root.destroy())
     root.bind("<Key-Q>", lambda e: root.destroy())
@@ -556,7 +556,19 @@ def build_ui() -> None:
 
         win = tk.Toplevel(root)
         win.title(title_text)
-        win.geometry("1100x650")
+        try:
+            root.update_idletasks()
+        except Exception:  # noqa: BLE001
+            pass
+        base_w = root.winfo_width()
+        base_h = root.winfo_height()
+        base_x = root.winfo_rootx()
+        base_y = root.winfo_rooty()
+        target_w = max(1100, base_w if base_w > 100 else 0)
+        target_h = max(800, base_h if base_h > 100 else 0)
+        target_x = base_x + base_w + 10 if base_w > 0 else base_x + 50
+        target_y = base_y
+        win.geometry(f"{target_w}x{target_h}+{target_x}+{target_y}")
         win.protocol("WM_DELETE_WINDOW", win.destroy)
         win.bind("<Key-q>", lambda e: win.destroy())
         win.bind("<Key-Q>", lambda e: win.destroy())
@@ -625,8 +637,12 @@ def build_ui() -> None:
         except Exception:  # noqa: BLE001
             op_hours_map = {}
 
+        alert_bar_rects: list[tuple[object, str, str, float]] = []
+        tooltip_win: tk.Toplevel | None = None
+
         def redraw_chart() -> None:
             ax.clear()
+            alert_bar_rects.clear()
 
             use_normalized = normalize_var.get()
             include_op_hours = show_op_hours_var.get() and not use_normalized
@@ -668,9 +684,10 @@ def build_ui() -> None:
                     picker=True,
                 )
                 ax_artists.append(bars)
-                for bar_rect, vehicle in zip(bars, vehicles):
+                for bar_rect, vehicle, val in zip(bars, vehicles, y_vals):
                     setattr(bar_rect, "_vehicle", vehicle)
                     setattr(bar_rect, "_alert", label)
+                    alert_bar_rects.append((bar_rect, vehicle, label, float(val)))
 
             # OP hours layer on secondary y-axis
             ax2.cla()
@@ -712,6 +729,58 @@ def build_ui() -> None:
 
         redraw_chart()
 
+        # Vehicle button panel for manual drilldown (fallback to avoid bar pick issues)
+        vehicle_panel = ttk.Frame(win, padding=(10, 4, 10, 10))
+        vehicle_panel.pack(fill="x")
+        ttk.Label(
+            vehicle_panel,
+            text="Open vehicle drilldown (pick alert then click a vehicle):",
+            anchor="w",
+        ).pack(anchor="w", pady=(0, 4))
+
+        selector_row = ttk.Frame(vehicle_panel)
+        selector_row.pack(fill="x", pady=(0, 6))
+        selected_alert_for_buttons = tk.StringVar(
+            value=series_alerts[0] if series_alerts else ""
+        )
+        ttk.Label(selector_row, text="Alert:").pack(side="left", padx=(0, 6))
+        ttk.OptionMenu(
+            selector_row, selected_alert_for_buttons, selected_alert_for_buttons.get(), *series_alerts
+        ).pack(side="left")
+
+        vehicle_buttons_frame = ttk.Frame(vehicle_panel)
+        vehicle_buttons_frame.pack(fill="x")
+
+        def open_vehicle_button(vehicle: str) -> None:
+            alert_name = selected_alert_for_buttons.get().strip()
+            if not alert_name:
+                messagebox.showinfo("Vehicle drilldown", "Select an alert first.")
+                return
+            show_vehicle_alert_timeseries(vehicle, alert_name)
+
+        def build_vehicle_buttons() -> None:
+            for child in vehicle_buttons_frame.winfo_children():
+                child.destroy()
+            if not vehicles:
+                ttk.Label(vehicle_buttons_frame, text="No vehicles to display").pack(anchor="w")
+                return
+            max_cols = 8
+            row = 0
+            col = 0
+            for vehicle in vehicles:
+                ttk.Button(
+                    vehicle_buttons_frame,
+                    text=vehicle,
+                    width=10,
+                    command=lambda v=vehicle: open_vehicle_button(v),
+                ).grid(row=row, column=col, padx=4, pady=2, sticky="w")
+                col += 1
+                if col >= max_cols:
+                    col = 0
+                    row += 1
+
+        build_vehicle_buttons()
+
         def show_vehicle_alert_timeseries(vehicle: str, alert_name: str) -> None:
             base_df = subset.copy()
             if "_start_dt" not in base_df.columns:
@@ -722,12 +791,6 @@ def build_ui() -> None:
             if base_df.empty:
                 messagebox.showinfo("Vehicle click", "No timestamps to build daily counts.")
                 return
-            min_dt = base_df["_start_dt"].min().normalize()
-            max_dt = base_df["_start_dt"].max().normalize()
-            if pd.isna(min_dt) or pd.isna(max_dt):
-                messagebox.showinfo("Vehicle click", "No timestamps to build daily counts.")
-                return
-
             normalized_vehicle = normalize_vehicle_number(base_df["vehicle_number"])
             mask = (normalized_vehicle == str(vehicle)) & (base_df["alert_name"] == alert_name)
             filtered = base_df[mask]
@@ -737,21 +800,185 @@ def build_ui() -> None:
                 )
                 return
 
-            daily = (
-                filtered.set_index("_start_dt")
-                .groupby(pd.Grouper(freq="D"))
-                .size()
-                .reset_index(name="count")
+            # Prepare OP_hours data for this vehicle (if available)
+            op_hours_vehicle_df = pd.DataFrame()
+            op_hour_col: str | None = None
+            op_hours_has_data = False
+
+            def _to_naive_datetime(series: pd.Series) -> pd.Series:
+                dt = pd.to_datetime(series, errors="coerce")
+                try:
+                    dt = dt.dt.tz_convert(None)
+                except Exception:
+                    try:
+                        dt = dt.dt.tz_localize(None)
+                    except Exception:
+                        pass
+                return dt
+
+            def _op_hours_windowed_df() -> pd.DataFrame:
+                if op_hours_df is None or op_hours_df.empty:
+                    return pd.DataFrame()
+                if time_filter.get() == "all":
+                    return op_hours_df.copy()
+                try:
+                    days = int(time_filter.get())
+                except ValueError:
+                    return op_hours_df.copy()
+                if "start_timestamp" not in op_hours_df.columns:
+                    return op_hours_df.copy()
+                working = op_hours_df.copy()
+                working["_start_dt"] = pd.to_datetime(working["start_timestamp"], errors="coerce", utc=True)
+                working = working.dropna(subset=["_start_dt"])
+                if working.empty:
+                    return pd.DataFrame()
+                max_dt = working["_start_dt"].max()
+                window_start = max_dt - pd.Timedelta(days=days)
+                return working[working["_start_dt"] >= window_start].copy()
+
+            op_hours_windowed = _op_hours_windowed_df()
+
+            if not op_hours_windowed.empty:
+                for candidate in ("live_hours", "live_hour", "op_hour"):
+                    if candidate in op_hours_windowed.columns:
+                        op_hour_col = candidate
+                        break
+                if op_hour_col:
+                    try:
+                        if "vehicle_number" in op_hours_windowed.columns:
+                            vehicles_oh = normalize_vehicle_number(op_hours_windowed["vehicle_number"])
+                        elif "vehicle_name" in op_hours_windowed.columns:
+                            vehicles_oh = normalize_vehicle_number(
+                                op_hours_windowed["vehicle_name"].map(_extract_vehicle_number)
+                            )
+                        else:
+                            vehicles_oh = pd.Series([], dtype=str)
+                        normalized_target = normalize_vehicle_number(pd.Series([vehicle])).iloc[0]
+                        mask_veh = vehicles_oh == normalized_target
+                        op_hours_vehicle_df = op_hours_windowed.loc[mask_veh].copy()
+                        if not op_hours_vehicle_df.empty and "start_timestamp" in op_hours_vehicle_df.columns:
+                            op_hours_vehicle_df["_start_dt"] = _to_naive_datetime(
+                                op_hours_vehicle_df["start_timestamp"]
+                            )
+                            op_hours_vehicle_df = op_hours_vehicle_df.dropna(subset=["_start_dt"])
+                        if not op_hours_vehicle_df.empty and "_start_dt" in op_hours_vehicle_df.columns:
+                            op_hours_vehicle_df["_start_dt"] = _to_naive_datetime(op_hours_vehicle_df["_start_dt"])
+                            op_hours_has_data = True
+                    except Exception:  # noqa: BLE001
+                        op_hours_has_data = False
+
+            # Determine combined time span (alerts + op_hours) so we fill zeros across full duration.
+            filtered["_start_dt"] = _to_naive_datetime(filtered["_start_dt"])
+            min_dt_alert = filtered["_start_dt"].min().normalize()
+            max_dt_alert = filtered["_start_dt"].max().normalize()
+            min_dt_oh = (
+                op_hours_vehicle_df["_start_dt"].min().normalize()
+                if op_hours_has_data and "_start_dt" in op_hours_vehicle_df.columns
+                else pd.NaT
             )
-            # Ensure the entire date range (per current filtered data) is covered, filling zeros.
-            full_range = pd.date_range(start=min_dt, end=max_dt, freq="D")
-            daily = daily.set_index("_start_dt").reindex(full_range, fill_value=0).reset_index()
-            daily.rename(columns={"index": "_start_dt"}, inplace=True)
-            daily["_start_dt"] = daily["_start_dt"].dt.date
-            daily = daily.sort_values("_start_dt")
-            x_labels = [str(d) for d in daily["_start_dt"].tolist()]
-            y_vals = daily["count"].astype(int).tolist()
-            x_pos = list(range(len(x_labels)))
+            max_dt_oh = (
+                op_hours_vehicle_df["_start_dt"].max().normalize()
+                if op_hours_has_data and "_start_dt" in op_hours_vehicle_df.columns
+                else pd.NaT
+            )
+
+            def _combine_min(a, b):
+                if pd.isna(a) and pd.isna(b):
+                    return pd.NaT
+                if pd.isna(a):
+                    return b
+                if pd.isna(b):
+                    return a
+                return min(a, b)
+
+            def _combine_max(a, b):
+                if pd.isna(a) and pd.isna(b):
+                    return pd.NaT
+                if pd.isna(a):
+                    return b
+                if pd.isna(b):
+                    return a
+                return max(a, b)
+
+            min_dt = _combine_min(min_dt_alert, min_dt_oh)
+            max_dt = _combine_max(max_dt_alert, max_dt_oh)
+            if pd.isna(min_dt) or pd.isna(max_dt):
+                messagebox.showinfo("Vehicle click", "No timestamps to build daily counts.")
+                return
+
+            # Look up OP_hours for this vehicle (if available)
+            op_hours_val: float | None = None
+            try:
+                veh_hours_df = op_hours_by_vehicle()
+                if not veh_hours_df.empty:
+                    normalized_target = normalize_vehicle_number(pd.Series([vehicle])).iloc[0]
+                    match = veh_hours_df[
+                        normalize_vehicle_number(veh_hours_df["vehicle_number"]) == normalized_target
+                    ]
+                    if not match.empty:
+                        op_hours_val = float(match.iloc[0]["live_hours_total"])
+            except Exception:  # noqa: BLE001
+                op_hours_val = None
+
+            freq_map = {
+                "daily": ("D", "%Y-%m-%d"),
+                "weekly": ("W", "Week of %Y-%m-%d"),
+                "monthly": ("M", "%Y-%m"),
+                "quotally": ("Q", "Q%q %Y"),
+            }
+
+            def format_label(ts: pd.Timestamp, mode: str) -> str:
+                if mode == "weekly":
+                    return f"Week of {ts.strftime('%Y-%m-%d')}"
+                if mode == "monthly":
+                    return ts.strftime("%Y-%m")
+                if mode == "quotally":
+                    quarter = ((ts.month - 1) // 3) + 1
+                    return f"{ts.year}-Q{quarter}"
+                return ts.strftime("%Y-%m-%d")
+
+            def build_bucketed(mode: str) -> tuple[list[str], list[int], list[pd.Timestamp]]:
+                freq, _fmt = freq_map.get(mode, ("D", "%Y-%m-%d"))
+                grouped = (
+                    filtered.set_index("_start_dt")
+                    .groupby(pd.Grouper(freq=freq))
+                    .size()
+                    .reset_index(name="count")
+                )
+                full_range = pd.date_range(start=min_dt, end=max_dt, freq=freq)
+                grouped = grouped.set_index("_start_dt").reindex(full_range, fill_value=0).reset_index()
+                grouped.rename(columns={"index": "_start_dt"}, inplace=True)
+                grouped = grouped.sort_values("_start_dt")
+                ts_list = grouped["_start_dt"].tolist()
+                labels = [format_label(ts, mode) for ts in ts_list]
+                values = grouped["count"].astype(int).tolist()
+                return labels, values, ts_list
+
+            def build_op_hours_bucketed(mode: str, ts_list: list[pd.Timestamp]) -> list[float]:
+                if not op_hours_has_data or op_hour_col is None or op_hours_vehicle_df.empty:
+                    return [0.0 for _ in ts_list]
+                freq, _fmt = freq_map.get(mode, ("D", "%Y-%m-%d"))
+                working = op_hours_vehicle_df.copy()
+                if "_start_dt" not in working.columns:
+                    return [0.0 for _ in ts_list]
+                working = working.dropna(subset=["_start_dt"])
+                if working.empty:
+                    return [0.0 for _ in ts_list]
+                try:
+                    grouped = (
+                        working.set_index("_start_dt")
+                        .groupby(pd.Grouper(freq=freq))[op_hour_col]
+                        .sum()
+                        .reset_index()
+                    )
+                except Exception:  # noqa: BLE001
+                    return [0.0 for _ in ts_list]
+                full_range = pd.date_range(start=min_dt, end=max_dt, freq=freq)
+                grouped = grouped.set_index("_start_dt").reindex(full_range, fill_value=0).reset_index()
+                grouped.rename(columns={"index": "_start_dt"}, inplace=True)
+                grouped = grouped.sort_values("_start_dt")
+                hours_map = {row["_start_dt"]: float(row[op_hour_col]) for _, row in grouped.iterrows()}
+                return [float(hours_map.get(ts, 0.0)) for ts in ts_list]
 
             win_ts = tk.Toplevel(root)
             win_ts.title(f"{alert_name} daily counts for vehicle {vehicle}")
@@ -773,17 +1000,145 @@ def build_ui() -> None:
 
             fig_ts = Figure(figsize=(8.5, 3.5), dpi=100)
             ax_ts = fig_ts.add_subplot(111)
-            ax_ts.bar(x_pos, y_vals, width=0.8, color="#5b8def", edgecolor="#2f5fb3")
-            ax_ts.set_xticks(x_pos)
-            ax_ts.set_xticklabels(x_labels, rotation=45, ha="right")
-            ax_ts.set_xlabel("Day")
-            ax_ts.set_ylabel("Count")
-            ax_ts.set_title(f"Daily counts for {alert_name} on {vehicle}")
-            fig_ts.tight_layout()
+            ax_ts2 = ax_ts.twinx()
+            freq_var = tk.StringVar(value="daily")
+            show_op_hours_var = tk.BooleanVar(value=False)
+            normalize_var = tk.BooleanVar(value=False)
+            x_labels, y_vals, ts_list = build_bucketed(freq_var.get())
+            x_pos = list(range(len(x_labels)))
 
             canvas_ts = FigureCanvasTkAgg(fig_ts, master=chart_ts)
             canvas_ts.draw()
             canvas_ts.get_tk_widget().pack(fill="both", expand=True)
+
+            controls_ts = ttk.Frame(win_ts, padding=(10, 0, 10, 6))
+            controls_ts.pack(fill="x")
+            ttk.Label(controls_ts, text="View:").pack(side="left", padx=(0, 6))
+            for label, value in [("Daily", "daily"), ("Weekly", "weekly"), ("Monthly", "monthly"), ("Quotally", "quotally")]:
+                tk.Radiobutton(
+                    controls_ts,
+                    text=label,
+                    value=value,
+                    variable=freq_var,
+                    indicatoron=0,
+                    width=max(7, len(label)),
+                    command=lambda: redraw_ts(),
+                ).pack(side="left", padx=3)
+
+            toggle_ts = ttk.Frame(win_ts, padding=(10, 0, 10, 6))
+            toggle_ts.pack(fill="x")
+            ttk.Checkbutton(
+                toggle_ts,
+                text="Show OP_hours",
+                variable=show_op_hours_var,
+                state="normal" if op_hours_has_data else "disabled",
+                command=lambda: redraw_ts(),
+            ).pack(side="left", padx=(0, 10))
+            ttk.Checkbutton(
+                toggle_ts,
+                text="Normalized with OP_hours",
+                variable=normalize_var,
+                state="normal" if op_hours_has_data else "disabled",
+                command=lambda: redraw_ts(),
+            ).pack(side="left")
+
+            # Scroll-to-zoom defaults; updated in redraw_ts
+            x_full_min = -0.5
+            x_full_max = len(x_pos) - 0.5 if x_pos else 0.5
+
+            def redraw_ts() -> None:
+                nonlocal x_full_min, x_full_max, x_labels, y_vals, ts_list, x_pos
+                mode = freq_var.get()
+                x_labels, y_vals, ts_list = build_bucketed(mode)
+                x_pos = list(range(len(x_labels)))
+                x_full_min = -0.5
+                x_full_max = len(x_pos) - 0.5 if x_pos else 0.5
+                ax_ts.clear()
+                ax_ts2.cla()
+                op_hours_series = build_op_hours_bucketed(mode, ts_list)
+                use_normalized = normalize_var.get() and op_hours_has_data
+                if use_normalized:
+                    plotted_vals = [
+                        round(v / op_hours_series[idx], 3) if idx < len(op_hours_series) and op_hours_series[idx] else 0.0
+                        for idx, v in enumerate(y_vals)
+                    ]
+                else:
+                    plotted_vals = y_vals
+
+                bar_width = 0.8
+                ax_ts.bar(x_pos, plotted_vals, width=bar_width, color="#5b8def", edgecolor="#2f5fb3")
+                ax_ts.set_xticks(x_pos)
+                ax_ts.set_xticklabels(x_labels, rotation=45, ha="right")
+                ax_ts.set_xlabel("Time")
+                ax_ts.set_ylabel("Count" if not use_normalized else "Count per OP_hour")
+                ax_ts.set_title(f"{mode.capitalize()} counts for {alert_name} on {vehicle}")
+
+                if show_op_hours_var.get() and not use_normalized and op_hours_has_data:
+                    overlay_width = bar_width * 0.4
+                    ax_ts2.bar(
+                        x_pos,
+                        op_hours_series,
+                        width=overlay_width,
+                        color="#666666",
+                        edgecolor="#444444",
+                        alpha=0.6,
+                        label="OP_hours",
+                    )
+                    ax_ts2.set_ylabel("OP_hours")
+                    ax_ts2.legend(loc="upper right")
+                else:
+                    ax_ts2.set_ylabel("")
+                    ax_ts2.set_yticks([])
+
+                fig_ts.tight_layout()
+                canvas_ts.draw_idle()
+
+            redraw_ts()
+
+            # Scroll-to-zoom on X axis for the daily bars
+            min_span = 1  # allow zoom down to 1 bucket
+
+            def clamp_limits(new_min: float, new_max: float) -> tuple[float, float]:
+                span = new_max - new_min
+                full_span = x_full_max - x_full_min
+                if span < min_span:
+                    span = min_span
+                if span > full_span:
+                    return x_full_min, x_full_max
+                if new_min < x_full_min:
+                    new_max += x_full_min - new_min
+                    new_min = x_full_min
+                if new_max > x_full_max:
+                    new_min -= new_max - x_full_max
+                    new_max = x_full_max
+                return new_min, new_max
+
+            def on_scroll_ts(event) -> None:
+                if getattr(event, "inaxes", None) != ax_ts or event.xdata is None:
+                    return
+                cur_min, cur_max = ax_ts.get_xlim()
+                direction = 0
+                # Matplotlib on Tk may provide step, or button (4/5 or names).
+                if hasattr(event, "step") and event.step:
+                    direction = event.step
+                else:
+                    btn = getattr(event, "button", "")
+                    if btn in ("up", "scroll_up", 4):
+                        direction = 1
+                    elif btn in ("down", "scroll_down", 5):
+                        direction = -1
+                if direction == 0:
+                    return
+                factor = 1.2 if direction > 0 else 1 / 1.2
+                center = event.xdata
+                new_min = center + (cur_min - center) / factor
+                new_max = center + (cur_max - center) / factor
+                new_min, new_max = clamp_limits(new_min, new_max)
+                ax_ts.set_xlim(new_min, new_max)
+                fig_ts.tight_layout()
+                canvas_ts.draw_idle()
+
+            canvas_ts.mpl_connect("scroll_event", on_scroll_ts)
 
             btn_ts = ttk.Frame(win_ts, padding=10)
             btn_ts.pack(fill="x")
@@ -802,7 +1157,67 @@ def build_ui() -> None:
                 return
             show_vehicle_alert_timeseries(vehicle, alert_name)
 
+        def on_click(event) -> None:
+            """Fallback if pick_event is not fired; hit-test alert bars manually."""
+            if not alert_bar_rects or event.inaxes != ax:
+                return
+            for rect, vehicle, alert_name, _ in alert_bar_rects:
+                contains, _ = rect.contains(event)
+                if contains:
+                    show_vehicle_alert_timeseries(vehicle, alert_name)
+                    return
+
+        def hide_tooltip() -> None:
+            nonlocal tooltip_win
+            if tooltip_win is not None:
+                try:
+                    tooltip_win.destroy()
+                except Exception:  # noqa: BLE001
+                    pass
+                tooltip_win = None
+
+        def show_tooltip(event, text: str) -> None:
+            nonlocal tooltip_win
+            hide_tooltip()
+            if getattr(event, "guiEvent", None) is None:
+                return
+            x_root = getattr(event.guiEvent, "x_root", None)
+            y_root = getattr(event.guiEvent, "y_root", None)
+            if x_root is None or y_root is None:
+                return
+            tooltip_win = tk.Toplevel(win)
+            tooltip_win.wm_overrideredirect(True)
+            tooltip_win.attributes("-topmost", True)
+            tooltip_win.wm_geometry(f"+{x_root + 12}+{y_root + 12}")
+            ttk.Label(
+                tooltip_win,
+                text=text,
+                background="#ffffe0",
+                relief="solid",
+                borderwidth=1,
+                padding=4,
+                justify="left",
+            ).pack()
+
+        def on_motion(event) -> None:
+            if not alert_bar_rects or event.inaxes != ax:
+                hide_tooltip()
+                return
+            for rect, vehicle, alert_name, val in alert_bar_rects:
+                contains, _ = rect.contains(event)
+                if contains:
+                    text = f"APM: {vehicle}\nAlert: {alert_name}\nValue: {val}"
+                    show_tooltip(event, text)
+                    return
+            hide_tooltip()
+
+        def on_leave(event) -> None:  # noqa: ARG001
+            hide_tooltip()
+
         canvas.mpl_connect("pick_event", on_pick)
+        canvas.mpl_connect("button_press_event", on_click)
+        canvas.mpl_connect("motion_notify_event", on_motion)
+        canvas.mpl_connect("figure_leave_event", on_leave)
 
         btn_row = ttk.Frame(win, padding=10)
         btn_row.pack(fill="x")
@@ -1346,27 +1761,48 @@ def build_ui() -> None:
         populate_tree(catsev_tree, catsev_df)
 
     def op_hours_by_vehicle() -> pd.DataFrame:
-        if op_hours_df is None or op_hours_df.empty:
+        def op_hours_windowed_df() -> pd.DataFrame:
+            if op_hours_df is None or op_hours_df.empty:
+                return pd.DataFrame()
+            if time_filter.get() == "all":
+                return op_hours_df.copy()
+            try:
+                days = int(time_filter.get())
+            except ValueError:
+                return op_hours_df.copy()
+            if "start_timestamp" not in op_hours_df.columns:
+                return op_hours_df.copy()
+            working = op_hours_df.copy()
+            working["_start_dt"] = pd.to_datetime(working["start_timestamp"], errors="coerce", utc=True)
+            working = working.dropna(subset=["_start_dt"])
+            if working.empty:
+                return pd.DataFrame()
+            max_dt = working["_start_dt"].max()
+            window_start = max_dt - pd.Timedelta(days=days)
+            return working[working["_start_dt"] >= window_start].copy()
+
+        filtered_oh = op_hours_windowed_df()
+        if filtered_oh.empty:
             return pd.DataFrame()
         # Pick the first matching hours column.
         hour_col: str | None = None
         for candidate in ("live_hours", "live_hour", "op_hour"):
-            if candidate in op_hours_df.columns:
+            if candidate in filtered_oh.columns:
                 hour_col = candidate
                 break
         if hour_col is None:
             return pd.DataFrame()
-        if "vehicle_number" in op_hours_df.columns:
-            vehicles = normalize_vehicle_number(op_hours_df["vehicle_number"])
-        elif "vehicle_name" in op_hours_df.columns:
-            vehicles = normalize_vehicle_number(op_hours_df["vehicle_name"].map(_extract_vehicle_number))
+        if "vehicle_number" in filtered_oh.columns:
+            vehicles = normalize_vehicle_number(filtered_oh["vehicle_number"])
+        elif "vehicle_name" in filtered_oh.columns:
+            vehicles = normalize_vehicle_number(filtered_oh["vehicle_name"].map(_extract_vehicle_number))
         else:
             return pd.DataFrame()
         try:
-            hours = pd.to_numeric(op_hours_df[hour_col], errors="coerce")
+            hours = pd.to_numeric(filtered_oh[hour_col], errors="coerce")
         except Exception:  # noqa: BLE001
             return pd.DataFrame()
-        names_col = op_hours_df["vehicle_name"] if "vehicle_name" in op_hours_df.columns else None
+        names_col = filtered_oh["vehicle_name"] if "vehicle_name" in filtered_oh.columns else None
         df = pd.DataFrame(
             {
                 "vehicle_number": vehicles,
